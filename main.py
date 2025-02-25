@@ -12,9 +12,27 @@ import select as select_module
 from contextlib import asynccontextmanager
 import psycopg2
 import psycopg2.extensions
+import logging
+import sys
+import os
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler('app.log')
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# Load environment variables
+from dotenv import load_dotenv
+load_dotenv()
 
 # Database setup
-DATABASE_URL = "postgresql://postgres:postgres@localhost:5433/postgres"
+DATABASE_URL = os.getenv('DATABASE_URL', "postgresql://postgres:postgres@localhost:5433/postgres")
 
 # Global state
 notification_queues = {}
@@ -37,22 +55,26 @@ async def handle_pg_notifications(initial_conn):
     max_retries = 5
     base_delay = 1  # Start with 1 second delay
     
+    logger.info("Starting notification handler")
+    
     while True:
         try:
             if not conn or conn.closed:
+                logger.error("Database connection is closed or None")
                 raise psycopg2.OperationalError("Connection is closed")
                 
             if select_module.select([conn], [], [], 1.0)[0]:
                 conn.poll()
                 while conn.notifies:
                     notify = conn.notifies.pop()
-                    print(f"Broadcasting notification to {len(notification_queues)} clients")
+                    logger.info(f"Broadcasting notification to {len(notification_queues)} clients: {notify.payload}")
                     for q in notification_queues.values():
                         await q.put(notify.payload)
             
             # If we get here, connection is healthy
             if not db_connection_healthy:
                 db_connection_healthy = True
+                logger.info("Database connection restored")
                 await broadcast_connection_status('connected')
                 retry_count = 0  # Reset retry count on successful connection
             
@@ -61,20 +83,21 @@ async def handle_pg_notifications(initial_conn):
         except (psycopg2.Error, psycopg2.OperationalError) as e:
             db_connection_healthy = False
             error_msg = f"Database connection error: {str(e)}"
-            print(error_msg)
+            logger.error(error_msg, exc_info=True)
             await broadcast_connection_status('disconnected', error_msg)
             
             # Close the old connection if it exists
             if conn and not conn.closed:
                 try:
                     conn.close()
-                except:
-                    pass
+                    logger.info("Closed old database connection")
+                except Exception as e:
+                    logger.error(f"Error closing connection: {e}")
             
             # Implement exponential backoff
             if retry_count < max_retries:
                 delay = min(30, base_delay * (2 ** retry_count))  # Cap at 30 seconds
-                print(f"Retrying connection in {delay} seconds...")
+                logger.info(f"Retrying connection in {delay} seconds (attempt {retry_count + 1}/{max_retries})")
                 await asyncio.sleep(delay)
                 
                 try:
@@ -84,47 +107,68 @@ async def handle_pg_notifications(initial_conn):
                     cur = conn.cursor()
                     cur.execute('LISTEN signin_changes;')
                     retry_count += 1
-                    print("Reconnected to database")
+                    logger.info("Successfully reconnected to database")
                 except Exception as e:
-                    print(f"Reconnection failed: {e}")
+                    logger.error(f"Reconnection attempt failed: {e}", exc_info=True)
             else:
-                print("Max retries reached, waiting for manual intervention")
+                logger.error("Max retries reached, waiting for manual intervention")
                 await asyncio.sleep(60)  # Wait a minute before trying again
                 retry_count = 0  # Reset retry count and try again
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global db_connection_healthy
+    notify_conn = None
+    task = None
+    retry_count = 0
+    max_retries = 5
     
-    try:
-        # Create a dedicated connection for LISTEN/NOTIFY
-        notify_conn = psycopg2.connect(DATABASE_URL)
-        notify_conn.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
-        cur = notify_conn.cursor()
-        cur.execute('LISTEN signin_changes;')
-        db_connection_healthy = True
-    except Exception as e:
-        db_connection_healthy = False
-        print(f"Initial database connection failed: {e}")
-        notify_conn = None
+    while retry_count < max_retries:
+        try:
+            # Create a dedicated connection for LISTEN/NOTIFY
+            logger.info("Attempting to establish PostgreSQL connection...")
+            notify_conn = psycopg2.connect(DATABASE_URL)
+            notify_conn.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
+            cur = notify_conn.cursor()
+            cur.execute('LISTEN signin_changes;')
+            db_connection_healthy = True
+            logger.info("Successfully connected to PostgreSQL")
+            break
+        except Exception as e:
+            retry_count += 1
+            db_connection_healthy = False
+            logger.error(f"Database connection attempt {retry_count} failed: {e}")
+            if retry_count < max_retries:
+                await asyncio.sleep(2 ** retry_count)  # Exponential backoff
+            notify_conn = None
     
-    # Start background task
-    task = asyncio.create_task(handle_pg_notifications(notify_conn))
+    if notify_conn:
+        # Start background task
+        logger.info("Starting notification handler task")
+        task = asyncio.create_task(handle_pg_notifications(notify_conn))
+    else:
+        logger.error("Failed to establish PostgreSQL connection after all retries")
     
     yield
     
     # Cleanup
-    task.cancel()
-    try:
-        await task
-    except asyncio.CancelledError:
-        pass
+    logger.info("Shutting down...")
+    if task:
+        logger.info("Cancelling notification handler task")
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            logger.info("Notification handler task cancelled")
+        except Exception as e:
+            logger.error(f"Error while cancelling task: {e}")
     
     if notify_conn:
         try:
             notify_conn.close()
-        except:
-            pass
+            logger.info("PostgreSQL connection closed")
+        except Exception as e:
+            logger.error(f"Error closing PostgreSQL connection: {e}")
 
 app = FastAPI(lifespan=lifespan)
 
