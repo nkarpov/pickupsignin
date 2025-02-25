@@ -123,53 +123,70 @@ async def lifespan(app: FastAPI):
     retry_count = 0
     max_retries = 5
     
-    while retry_count < max_retries:
+    try:
+        # Run database setup first
+        logger.info("Running database setup...")
         try:
-            # Create a dedicated connection for LISTEN/NOTIFY
-            logger.info("Attempting to establish PostgreSQL connection...")
-            notify_conn = psycopg2.connect(DATABASE_URL)
-            notify_conn.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
-            cur = notify_conn.cursor()
-            cur.execute('LISTEN signin_changes;')
-            db_connection_healthy = True
-            logger.info("Successfully connected to PostgreSQL")
-            break
+            setup_database()
+            logger.info("Database setup completed successfully")
         except Exception as e:
-            retry_count += 1
-            db_connection_healthy = False
-            logger.error(f"Database connection attempt {retry_count} failed: {e}")
-            if retry_count < max_retries:
-                await asyncio.sleep(2 ** retry_count)  # Exponential backoff
-            notify_conn = None
+            logger.error(f"Database setup failed: {str(e)}", exc_info=True)
+            raise
+        
+        while retry_count < max_retries:
+            try:
+                # Create a dedicated connection for LISTEN/NOTIFY
+                logger.info("Attempting to establish PostgreSQL connection...")
+                notify_conn = psycopg2.connect(DATABASE_URL)
+                notify_conn.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
+                cur = notify_conn.cursor()
+                cur.execute('LISTEN signin_changes;')
+                db_connection_healthy = True
+                logger.info("Successfully connected to PostgreSQL")
+                break
+            except Exception as e:
+                retry_count += 1
+                db_connection_healthy = False
+                logger.error(f"Database connection attempt {retry_count} failed: {str(e)}", exc_info=True)
+                if retry_count < max_retries:
+                    await asyncio.sleep(2 ** retry_count)  # Exponential backoff
+                notify_conn = None
+        
+        if notify_conn:
+            # Start background task
+            logger.info("Starting notification handler task")
+            task = asyncio.create_task(handle_pg_notifications(notify_conn))
+        else:
+            logger.error("Failed to establish PostgreSQL connection after all retries")
+            raise RuntimeError("Could not establish database connection")
+        
+        yield
+        
+    except Exception as e:
+        logger.error(f"Lifespan error: {str(e)}", exc_info=True)
+        raise
     
-    if notify_conn:
-        # Start background task
-        logger.info("Starting notification handler task")
-        task = asyncio.create_task(handle_pg_notifications(notify_conn))
-    else:
-        logger.error("Failed to establish PostgreSQL connection after all retries")
-    
-    yield
-    
-    # Cleanup
-    logger.info("Shutting down...")
-    if task:
-        logger.info("Cancelling notification handler task")
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            logger.info("Notification handler task cancelled")
-        except Exception as e:
-            logger.error(f"Error while cancelling task: {e}")
-    
-    if notify_conn:
-        try:
-            notify_conn.close()
-            logger.info("PostgreSQL connection closed")
-        except Exception as e:
-            logger.error(f"Error closing PostgreSQL connection: {e}")
+    finally:
+        # Cleanup
+        logger.info("Shutting down...")
+        if task:
+            logger.info("Cancelling notification handler task")
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                logger.info("Notification handler task cancelled")
+            except Exception as e:
+                logger.error(f"Error while cancelling task: {str(e)}", exc_info=True)
+        
+        if notify_conn:
+            try:
+                notify_conn.close()
+                logger.info("PostgreSQL connection closed")
+            except Exception as e:
+                logger.error(f"Error closing PostgreSQL connection: {str(e)}", exc_info=True)
 
+# Create FastAPI app
 app = FastAPI(lifespan=lifespan)
 
 # Create SQLAlchemy engine
@@ -239,8 +256,6 @@ def setup_database():
             EXECUTE FUNCTION notify_signin_changes();
         """))
         conn.commit()
-
-setup_database()
 
 # Serve static files
 app.mount("/static", StaticFiles(directory="static"), name="static")
