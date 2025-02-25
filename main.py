@@ -16,10 +16,10 @@ import logging
 import sys
 import os
 
-# Configure logging
+# Configure logging to match uvicorn's format
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    format='%(levelname)s:     %(message)s',
     handlers=[
         logging.StreamHandler(sys.stdout),
         logging.FileHandler('app.log')
@@ -311,7 +311,7 @@ async def event_generator():
     queue_id += 1
     my_queue = asyncio.Queue()
     notification_queues[my_queue_id] = my_queue
-    print(f"New client connected (id: {my_queue_id}). Total clients: {len(notification_queues)}")
+    logger.info(f"New client connected (id: {my_queue_id}). Total clients: {len(notification_queues)}")
     
     try:
         # Check connection health immediately
@@ -334,7 +334,7 @@ async def event_generator():
                 "data": json.dumps(initial_data)
             }
         except Exception as e:
-            print(f"Error getting initial data: {e}")
+            logger.error(f"Error getting initial data: {e}", exc_info=True)
             yield {
                 "event": "connection_status",
                 "data": json.dumps({
@@ -350,7 +350,7 @@ async def event_generator():
                 # Use a shorter timeout to be more responsive
                 payload = await asyncio.wait_for(my_queue.get(), timeout=0.1)
                 notification = json.loads(payload)
-                print(f"Client {my_queue_id} received notification: {notification['type']}")
+                logger.debug(f"Client {my_queue_id} received notification: {notification['type']}")
                 yield {
                     "event": notification['type'],
                     "data": json.dumps(notification['data'])
@@ -359,15 +359,15 @@ async def event_generator():
                 # No new notifications, continue waiting
                 continue
             except Exception as e:
-                print(f"Error processing notification: {e}")
+                logger.error(f"Error processing notification: {e}", exc_info=True)
                 continue
     except Exception as e:
-        print(f"Error in event generator: {e}")
+        logger.error(f"Error in event generator: {e}", exc_info=True)
         raise
     finally:
         # Clean up the queue when client disconnects
         del notification_queues[my_queue_id]
-        print(f"Client disconnected (id: {my_queue_id}). Remaining clients: {len(notification_queues)}")
+        logger.info(f"Client disconnected (id: {my_queue_id}). Remaining clients: {len(notification_queues)}")
 
 @app.get("/api/stream")
 async def stream():
